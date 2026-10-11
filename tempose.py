@@ -11,7 +11,114 @@ from positional_encodings.torch_encodings import PositionalEncoding1D
 from torchinfo import summary
 from stgcn import ST_GCN_Block, ST_GCN_10
 
+class MultiHeadCrossAttention(nn.Module):
+    def __init__(self, d_model, d_head, n_head, drop_p) -> None:
+        super().__init__()
+        d_cat = d_head * n_head
 
+        self.h = n_head
+        self.to_q = nn.Linear(d_model, d_cat, bias=False)
+        self.to_kv = nn.Linear(d_model, d_cat * 2, bias=False)
+        self.scale = d_head**-0.5
+
+        self.attend = nn.Sequential(
+            nn.Softmax(dim=-1),
+            nn.Dropout(drop_p)  # This shouldn't be inplace.
+        )
+        
+        self.tail = nn.Sequential(
+            nn.Linear(d_cat, d_model),
+            nn.Dropout(drop_p, inplace=True)
+        ) if n_head != 1 or d_cat != d_model else nn.Identity()
+    def forward(self, x1: Tensor, x2: Tensor, mask: Tensor = None):
+
+        # x1: (B, Q, d_model)
+        # x2: (B, K, d_model)
+
+        q = self.to_q(x1)
+        kv = self.to_kv(x2)
+
+        B, Q, _ = q.shape
+        _, K, _ = kv.shape
+
+        # -------------------------
+        # Query
+        # -------------------------
+        q = q.view(B, Q, self.h, -1)
+        q = q.transpose(1, 2).contiguous()
+        # (B, h, Q, d_head)
+
+        # -------------------------
+        # Key / Value
+        # -------------------------
+        kv = kv.view(B, K, self.h, 2, -1)
+        kv = kv.transpose(1, 2).contiguous()
+        # (B, h, K, 2, d_head)
+
+        k = kv[:, :, :, 0, :]
+        v = kv[:, :, :, 1, :]
+
+        k_T = k.transpose(-1, -2).contiguous()
+        # (B, h, d_head, K)
+
+        # -------------------------
+        # Attention
+        # -------------------------
+        dots = (q @ k_T) * self.scale
+        # (B, h, Q, K)
+
+        # -------------------------
+        # Mask
+        # -------------------------
+        if mask is not None:
+            # mask: (B, K)
+            mask = mask.view(B, 1, 1, K)
+            dots = dots.masked_fill(mask == 0, -torch.inf)
+
+        coef = self.attend(dots)
+
+        attention = coef @ v
+        # (B, h, Q, d_head)
+
+        # -------------------------
+        # Merge heads
+        # -------------------------
+        out = attention.transpose(1, 2).reshape(B, Q, -1)
+
+        out = self.tail(out)
+
+        return out
+
+
+class CrossTransformerLayer(nn.Module):
+    def __init__(self, d_model, d_head, n_head, hd_mlp, drop_p) -> None:
+        super().__init__()
+        self.layer_norm1_x1 = nn.LayerNorm(d_model)
+        self.layer_norm1_x2 = nn.LayerNorm(d_model)
+        self.cross_attn = MultiHeadCrossAttention(d_model, d_head, n_head, drop_p)
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid()
+        )
+        self.layer_norm2 = nn.LayerNorm(d_model)
+        self.ff = FeedForward(d_model, d_model, hd_mlp, drop_p)
+
+    def forward(self, x1, x2, mask=None):
+
+        z1 = self.layer_norm1_x1(x1)
+        z2 = self.layer_norm1_x2(x2)
+
+        attn = self.cross_attn(z1, z2, mask)
+       
+
+        x = attn + x1
+
+        z = self.layer_norm2(x)
+
+        x = self.ff(z) + x
+
+        return x
+    
 class MLP(nn.Module):
     '''Same as MLP_Block in TemPose paper.'''
     def __init__(self, in_dim, out_dim, hd_dim, drop_p=0.0) -> None:
@@ -4170,6 +4277,1874 @@ class TemPose_TF2withStrokeFusion(nn.Module):
         
         return x_output
 
+class Stroke_EmbeddingTA(nn.Module):
+    def __init__(self, type_size, emb_size, hid_size):
+        super().__init__()
+        self.embedding = nn.Embedding(
+            num_embeddings=type_size,
+            embedding_dim=emb_size,
+            padding_idx=0
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(emb_size, hid_size),
+            nn.ReLU(),
+            nn.Linear(hid_size, hid_size)
+        )
+        # 添加這一行，將 hid_size 儲存為實例屬性
+        self.hid_size = hid_size
+       
+    def forward(self, pre_stroke: Tensor):
+        """
+        輸入:
+            pre_stroke: (N, 1)，每列是 [前一拍類別]，N 是所有序列的 stroke 總數
+        輸出:
+            x_final: (N, hid_size) (每拍一個特徵向量)
+        """
+        # # 拆成兩個 tensor
+        # pre = pre_next_stroke[:, 0]  # (N,)
+        # nxt = pre_next_stroke[:, 1]  # (N,)
+
+        # 做 embedding： (N, D)
+        if pre_stroke.dim() > 1:
+            pre_stroke = pre_stroke[:, 0]
+        pre_emb = self.embedding(pre_stroke)
+
+
+        # 融合： (N, hid_size)
+        x_final = self.fusion(pre_emb)
+        return x_final
+
+class Stroke_TA(nn.Module): 
+
+    def __init__(self, type_size, emb_size, hid_size):
+        super().__init__()
+
+        self.embedding = nn.Embedding(
+            num_embeddings=type_size,
+            embedding_dim=emb_size,
+            padding_idx=0
+        )
+
+        self.fusion = nn.Sequential(
+            nn.Linear(emb_size , hid_size),
+            nn.ReLU(),
+            nn.Linear(hid_size, hid_size)
+        )
+
+    def forward(self, pre_next_stroke):
+
+        pre = pre_next_stroke[:,0]
+        nxt = pre_next_stroke[:,1]
+
+        pre_emb = self.embedding(pre)
+        next_emb = self.embedding(nxt)
+        pre_emb = self.fusion(pre_emb)
+        next_emb = self.fusion(next_emb)
+
+        return pre_emb, next_emb
+
+class TemPose_TFwithtwostageStrokeTA(nn.Module):
+    def __init__(
+        self, in_dim, seq_len, n_class=31, n_people=2,
+        d_model=100, d_head=128, n_head=6, depth_tem=2, depth_inter=2,
+        drop_p=0.3, mlp_d_scale=4, tcn_kernel_size=5,
+        type_size=31, emb_size=128, hid_size=256 
+    ):
+        super().__init__()
+        
+        if n_people > 2:
+            raise NotImplementedError
+        
+        # TCN layers
+        self.project = nn.Linear(in_dim, d_model)
+
+        # TCN layers for top, bottom, shuttle
+        tcn_channels = [d_model // 2, d_model] 
+        
+        self.tcn_top = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_bottom = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_shuttle = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+
+
+        # Temporal Transformer Layers
+        self.learned_token_tem = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_tem = nn.Parameter(torch.empty(1, n_people + 3, 1 + seq_len, d_model))
+        self.pre_dropout = nn.Dropout(drop_p, inplace=True)
+        self.encoder_tem = TransformerEncoder(d_model, d_head, n_head, depth_tem, d_model * mlp_d_scale, drop_p)
+
+        # Interactional Transformer Layers
+        self.learned_token_inter = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_inter = nn.Parameter(torch.empty(1, 1 + n_people + 3, d_model))
+        self.encoder_inter = TransformerEncoder(d_model, d_head, n_head, depth_inter, d_model * mlp_d_scale, drop_p)
+
+        # MLP Head for output  
+        self.mlp_head = MLP_Head(d_model * 2, n_class, d_model * mlp_d_scale, drop_p) 
+        # self.mlp_head = ResidualMLP_Head(d_model + hid_size, n_class, d_model * mlp_d_scale, drop_p)
+
+        # Stroke fusion model
+        self.Jnb_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+
+        self.shuttle_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+        # CrossTransformerLayer
+        self.embedding_cross = nn.Parameter(torch.empty(1, seq_len, d_model))
+        self.cross_trans = CrossTransformerLayer(d_model, d_head, n_head, d_model * mlp_d_scale, drop_p)
+
+        # # Bidirectional Cross Attention
+        # self.cross_shuttle_to_semantic = CrossTransformerLayer(
+        #     d_model, d_head, n_head,
+        #     d_model * mlp_d_scale,
+        #     drop_p
+        # )
+
+        # self.cross_semantic_to_shuttle = CrossTransformerLayer(
+        #     d_model, d_head, n_head,
+        #     d_model * mlp_d_scale,
+        #     drop_p
+        # )
+        self.stroke_ca = Stroke_TA(type_size=type_size, emb_size=emb_size, hid_size=hid_size)
+        self.stroke_dropout = nn.Dropout(drop_p, inplace=True)
+        self.semantic_proj = nn.Linear(hid_size, d_model)
+        self.semantic_pool = nn.Linear(d_model, 1) 
+        self.semantic_type_embedding = nn.Parameter(torch.zeros(1, 2, d_model)) #0527
+        self.semantic_norm = nn.LayerNorm(d_model) #0527
+        self.temporal_semantic_pool = nn.Linear(d_model, 1) #0527
+        self.semantic_global_gate = nn.Sequential(  #0527
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()
+        )
+        self.d_model = d_model
+        self.init_weights()
+        # for param in self.stroke_fusion_model.parameters():
+        #     param.requires_grad = False
+            
+    @torch.no_grad()
+    def init_weights(self):
+        p_enc_1d_model = PositionalEncoding1D(self.d_model)
+        
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_tem.squeeze(0))
+        self.embedding_tem.copy_(pos_encoding.unsqueeze(0))
+
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_inter)
+        self.embedding_inter.copy_(pos_encoding)
+
+        nn.init.normal_(self.learned_token_tem, std=0.02)
+        nn.init.normal_(self.learned_token_inter, std=0.02)
+        nn.init.normal_(self.semantic_type_embedding, std=0.02) #0527
+
+        self.apply(self.init_weights_recursive)
+
+    def init_weights_recursive(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv1d):
+            nn.init.xavier_normal_(m.weight)
+
+    def forward(self, JnB: Tensor, pos: Tensor, shuttle: Tensor, video_len: Tensor, pre_next_stroke: Tensor):
+       
+        
+
+        # Semantic Embedding
+        # pre_next_feature = self.stroke_fusion_model(pre_next_stroke)
+        pre_emb, next_emb = self.stroke_ca(pre_next_stroke)
+        pre_emb = self.stroke_dropout(self.semantic_proj(pre_emb))
+        next_emb = self.stroke_dropout(self.semantic_proj(next_emb))
+
+
+        #shuttle attends semantic
+        semantic_tokens = torch.stack(
+            [pre_emb, next_emb],
+            dim=1
+        )
+        semantic_tokens = self.semantic_norm(
+            semantic_tokens + self.semantic_type_embedding
+        )
+        # Step 4: Process position and shuttle data (position features for top/bottom and shuttle features)
+        pos_top = pos[:, :, 0, :].transpose(1, 2).contiguous()
+        pos_bottom = pos[:, :, 1, :].transpose(1, 2).contiguous()
+        shuttle = shuttle.transpose(1, 2).contiguous()
+       
+        # Apply TCNs on positional and shuttle data
+        pos_top = self.tcn_top(pos_top)
+        pos_bottom = self.tcn_bottom(pos_bottom)
+        shuttle = self.tcn_shuttle(shuttle)
+
+       
+        pos_top = pos_top.transpose(1, 2)
+        pos_bottom = pos_bottom.transpose(1, 2)
+        shuttle = shuttle.transpose(1, 2)
+        
+        # Cross Attention
+        T_shuttle = shuttle.shape[1]
+
+        range_t = torch.arange(
+            T_shuttle,
+            device=shuttle.device
+        ).unsqueeze(0)
+
+      
+
+
+        # shuttle attends semantic
+        semantic_mask = None
+
+        shuttle_attn = self.cross_trans(
+            shuttle,            # Q
+            semantic_tokens,    # KV
+            semantic_mask
+        )
+
+      
+        shuttle_alpha = self.shuttle_gate(
+            torch.cat([shuttle, shuttle_attn], dim=-1)
+        )
+        shuttle = shuttle + shuttle_alpha * shuttle_attn
+        JnB = JnB.transpose(1, 2).contiguous()  # (b, n, t, input_dim)
+        x = self.project(JnB)  # Project to the desired model dimension
+        b, n, t, d = x.shape  # b: batch_size, n: num_people, t: sequence_length, d: feature_dim
+        JnB_top = x[:, 0]       # (B,T,D)
+        JnB_bottom = x[:, 1]    # (B,T,D)
+
+        semantic_context_top = self.cross_trans(
+            JnB_top,          # Q
+            semantic_tokens,  # KV
+            None
+        )
+
+        semantic_context_bottom = self.cross_trans(
+            JnB_bottom,
+            semantic_tokens,
+            None
+        )
+        semantic_feature = shuttle_attn
+
+        
+        #shuttle attends semantic
+        gate_input_top = torch.cat(
+        [JnB_top, semantic_context_top],
+        dim=-1
+        )
+
+        gate_input_bottom = torch.cat(
+            [JnB_bottom, semantic_context_bottom],
+            dim=-1
+        )
+        
+      
+
+        alpha = self.Jnb_gate(gate_input_top)      # (B,T,1)
+        beta  = self.Jnb_gate(gate_input_bottom)   # (B,T,1)
+        # gamma = gate_weight[..., 2].unsqueeze(-1)
+
+        # x = (
+        #     alpha * semantic_context
+        #     +
+        #     (1 - alpha) * x
+        # )
+        JnB_top = JnB_top + alpha * semantic_context_top
+
+        JnB_bottom = JnB_bottom + beta * semantic_context_bottom
+        x = torch.stack(
+            [JnB_top, JnB_bottom],
+            dim=1
+        )
+        # Step 5: Concatenate additional features with original TCN features
+        x_additional = torch.stack((pos_top, pos_bottom, shuttle), dim=1)
+        x = torch.cat((x, x_additional), dim=1)
+        n += 3  # Update number of people with the additional features (top, bottom, shuttle)
+
+        # Step 6: Temporal Transformer Layer
+        class_token_tem = self.learned_token_tem.view(1, 1, 1, -1).expand(b, n, -1, -1)
+        x = torch.cat((class_token_tem, x), dim=2)
+        t += 1  # Add 1 for class token
+
+        x = x + self.embedding_tem
+        x = self.pre_dropout(x)
+        x = x.view(b * n, t, d)
+
+        range_t = torch.arange(0, t, device=x.device).unsqueeze(0).expand(b, -1)
+        video_len_tem = video_len.unsqueeze(-1)
+
+        mask = range_t < (
+            1 + video_len_tem
+        )
+
+        mask = mask.repeat_interleave(
+            n,
+            dim=0
+        )
+        # video_len = video_len.unsqueeze(-1)
+        # mask = range_t < (1 + video_len)
+        # mask = mask.repeat_interleave(n, dim=0)
+        
+        x = self.encoder_tem(x, mask)
+        x = x[:, 0].view(b, n, d)
+
+        # Step 7: Interactional Transformer Layer
+        class_token_inter = self.learned_token_inter.view(1, 1, -1).expand(b, -1, -1)
+        x = torch.cat((class_token_inter, x), dim=1)
+        n += 1  # Add 1 for interaction class token
+
+        x = x + self.embedding_inter
+        x = self.encoder_inter(x)
+        x = x[:, 0].contiguous()
+        
+        x_main_features = x.view(b, -1)  # Ensure the shape is (batch_size, d_model)
+
+
+
+        #semantic feature的方法
+        # semantic_global = semantic_tokens.mean(dim=1)  # (B,T,1)
+        semantic_score = self.semantic_pool(semantic_tokens)
+        semantic_weight = F.softmax(semantic_score, dim=1)
+        # semantic_global = (semantic_weight * semantic_tokens).sum(dim=1) #0526
+        token_global = (semantic_weight * semantic_tokens).sum(dim=1)
+
+        temporal_semantic_score = self.temporal_semantic_pool(
+            semantic_feature
+        )
+        temporal_mask = torch.arange(
+            semantic_feature.shape[1],
+            device=semantic_feature.device
+        ).unsqueeze(0) < video_len.unsqueeze(1)
+        temporal_semantic_score = temporal_semantic_score.masked_fill(
+            ~temporal_mask.unsqueeze(-1),
+            torch.finfo(temporal_semantic_score.dtype).min
+        )
+        temporal_semantic_weight = F.softmax(
+            temporal_semantic_score,
+            dim=1
+        )
+        temporal_global = (
+            temporal_semantic_weight * semantic_feature
+        ).sum(dim=1)
+
+        semantic_global_alpha = self.semantic_global_gate(
+            torch.cat([token_global, temporal_global], dim=-1)
+        )
+        semantic_global = (
+            semantic_global_alpha * token_global
+            +
+            (1 - semantic_global_alpha) * temporal_global
+        )
+    
+         ##semantic attends shuttle
+        x_combined = torch.cat([
+            x_main_features,
+            semantic_global
+        ], dim=1)
+    
+        x_output = self.mlp_head(x_combined)
+        
+        return x_output
+
+class TemPose_TFwithtwostageOneStrokeTA(nn.Module):
+    def __init__(
+        self, in_dim, seq_len, n_class=31, n_people=2,
+        d_model=100, d_head=128, n_head=6, depth_tem=2, depth_inter=2,
+        drop_p=0.3, mlp_d_scale=4, tcn_kernel_size=5,
+        type_size=31, emb_size=128, hid_size=256 
+    ):
+        super().__init__()
+        
+        if n_people > 2:
+            raise NotImplementedError
+        
+        # TCN layers
+        self.project = nn.Linear(in_dim, d_model)
+
+        # TCN layers for top, bottom, shuttle
+        tcn_channels = [d_model // 2, d_model] 
+        
+        self.tcn_top = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_bottom = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_shuttle = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+
+
+        # Temporal Transformer Layers
+        self.learned_token_tem = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_tem = nn.Parameter(torch.empty(1, n_people + 3, 1 + seq_len, d_model))
+        self.pre_dropout = nn.Dropout(drop_p, inplace=True)
+        self.encoder_tem = TransformerEncoder(d_model, d_head, n_head, depth_tem, d_model * mlp_d_scale, drop_p)
+
+        # Interactional Transformer Layers
+        self.learned_token_inter = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_inter = nn.Parameter(torch.empty(1, 1 + n_people + 3, d_model))
+        self.encoder_inter = TransformerEncoder(d_model, d_head, n_head, depth_inter, d_model * mlp_d_scale, drop_p)
+
+        # MLP Head for output  
+        self.mlp_head = MLP_Head(d_model * 2, n_class, d_model * mlp_d_scale, drop_p) 
+        # self.mlp_head = ResidualMLP_Head(d_model + hid_size, n_class, d_model * mlp_d_scale, drop_p)
+
+        # Stroke fusion model
+        self.Jnb_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+
+        self.shuttle_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+        # CrossTransformerLayer
+        self.embedding_cross = nn.Parameter(torch.empty(1, seq_len, d_model))
+        self.cross_trans = CrossTransformerLayer(d_model, d_head, n_head, d_model * mlp_d_scale, drop_p)
+
+    
+        self.stroke_emb = Stroke_EmbeddingTA(type_size=type_size, emb_size=emb_size, hid_size=hid_size)
+        self.stroke_dropout = nn.Dropout(drop_p, inplace=True)
+        self.semantic_proj = nn.Linear(hid_size, d_model)
+        self.semantic_pool = nn.Linear(d_model, 1) 
+        self.semantic_type_embedding = nn.Parameter(torch.zeros(1, 1, d_model)) #0527
+        self.semantic_norm = nn.LayerNorm(d_model) #0527
+        self.temporal_semantic_pool = nn.Linear(d_model, 1) #0527
+        self.semantic_global_gate = nn.Sequential(  #0527
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()
+        )
+        self.d_model = d_model
+        self.init_weights()
+        # for param in self.stroke_fusion_model.parameters():
+        #     param.requires_grad = False
+            
+    @torch.no_grad()
+    def init_weights(self):
+        p_enc_1d_model = PositionalEncoding1D(self.d_model)
+        
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_tem.squeeze(0))
+        self.embedding_tem.copy_(pos_encoding.unsqueeze(0))
+
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_inter)
+        self.embedding_inter.copy_(pos_encoding)
+
+        nn.init.normal_(self.learned_token_tem, std=0.02)
+        nn.init.normal_(self.learned_token_inter, std=0.02)
+        nn.init.normal_(self.semantic_type_embedding, std=0.02) #0527
+
+        self.apply(self.init_weights_recursive)
+
+    def init_weights_recursive(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv1d):
+            nn.init.xavier_normal_(m.weight)
+
+    def forward(self, JnB: Tensor, pos: Tensor, shuttle: Tensor, video_len: Tensor, pre_next_stroke: Tensor):
+       
+        
+
+        # Semantic Embedding
+        # pre_next_feature = self.stroke_fusion_model(pre_next_stroke)
+        pre_emb = self.stroke_emb(pre_next_stroke)
+        pre_emb = self.stroke_dropout(self.semantic_proj(pre_emb))
+        # next_emb = self.stroke_dropout(self.semantic_proj(next_emb))
+
+
+        #shuttle attends semantic
+        semantic_tokens = pre_emb.unsqueeze(1)
+        semantic_tokens = self.semantic_norm(
+            semantic_tokens + self.semantic_type_embedding
+        )
+        # Step 4: Process position and shuttle data (position features for top/bottom and shuttle features)
+        pos_top = pos[:, :, 0, :].transpose(1, 2).contiguous()
+        pos_bottom = pos[:, :, 1, :].transpose(1, 2).contiguous()
+        shuttle = shuttle.transpose(1, 2).contiguous()
+       
+        # Apply TCNs on positional and shuttle data
+        pos_top = self.tcn_top(pos_top)
+        pos_bottom = self.tcn_bottom(pos_bottom)
+        shuttle = self.tcn_shuttle(shuttle)
+
+       
+        pos_top = pos_top.transpose(1, 2)
+        pos_bottom = pos_bottom.transpose(1, 2)
+        shuttle = shuttle.transpose(1, 2)
+        
+        # Cross Attention
+        T_shuttle = shuttle.shape[1]
+
+        range_t = torch.arange(
+            T_shuttle,
+            device=shuttle.device
+        ).unsqueeze(0)
+
+      
+
+
+        # shuttle attends semantic
+        semantic_mask = None
+
+        shuttle_attn = self.cross_trans(
+            shuttle,            # Q
+            semantic_tokens,    # KV
+            semantic_mask
+        )
+
+      
+        shuttle_alpha = self.shuttle_gate(
+            torch.cat([shuttle, shuttle_attn], dim=-1)
+        )
+        shuttle = shuttle + shuttle_alpha * shuttle_attn
+        JnB = JnB.transpose(1, 2).contiguous()  # (b, n, t, input_dim)
+        x = self.project(JnB)  # Project to the desired model dimension
+        b, n, t, d = x.shape  # b: batch_size, n: num_people, t: sequence_length, d: feature_dim
+        JnB_top = x[:, 0]       # (B,T,D)
+        JnB_bottom = x[:, 1]    # (B,T,D)
+
+        semantic_context_top = self.cross_trans(
+            JnB_top,          # Q
+            semantic_tokens,  # KV
+            None
+        )
+
+        semantic_context_bottom = self.cross_trans(
+            JnB_bottom,
+            semantic_tokens,
+            None
+        )
+        semantic_feature = shuttle_attn
+
+        
+        #shuttle attends semantic
+        gate_input_top = torch.cat(
+        [JnB_top, semantic_context_top],
+        dim=-1
+        )
+
+        gate_input_bottom = torch.cat(
+            [JnB_bottom, semantic_context_bottom],
+            dim=-1
+        )
+        
+      
+
+        alpha = self.Jnb_gate(gate_input_top)      # (B,T,1)
+        beta  = self.Jnb_gate(gate_input_bottom)   # (B,T,1)
+        # gamma = gate_weight[..., 2].unsqueeze(-1)
+
+        # x = (
+        #     alpha * semantic_context
+        #     +
+        #     (1 - alpha) * x
+        # )
+        JnB_top = JnB_top + alpha * semantic_context_top
+
+        JnB_bottom = JnB_bottom + beta * semantic_context_bottom
+        x = torch.stack(
+            [JnB_top, JnB_bottom],
+            dim=1
+        )
+        # Step 5: Concatenate additional features with original TCN features
+        x_additional = torch.stack((pos_top, pos_bottom, shuttle), dim=1)
+        x = torch.cat((x, x_additional), dim=1)
+        n += 3  # Update number of people with the additional features (top, bottom, shuttle)
+
+        # Step 6: Temporal Transformer Layer
+        class_token_tem = self.learned_token_tem.view(1, 1, 1, -1).expand(b, n, -1, -1)
+        x = torch.cat((class_token_tem, x), dim=2)
+        t += 1  # Add 1 for class token
+
+        x = x + self.embedding_tem
+        x = self.pre_dropout(x)
+        x = x.view(b * n, t, d)
+
+        range_t = torch.arange(0, t, device=x.device).unsqueeze(0).expand(b, -1)
+        video_len_tem = video_len.unsqueeze(-1)
+
+        mask = range_t < (
+            1 + video_len_tem
+        )
+
+        mask = mask.repeat_interleave(
+            n,
+            dim=0
+        )
+        # video_len = video_len.unsqueeze(-1)
+        # mask = range_t < (1 + video_len)
+        # mask = mask.repeat_interleave(n, dim=0)
+        
+        x = self.encoder_tem(x, mask)
+        x = x[:, 0].view(b, n, d)
+
+        # Step 7: Interactional Transformer Layer
+        class_token_inter = self.learned_token_inter.view(1, 1, -1).expand(b, -1, -1)
+        x = torch.cat((class_token_inter, x), dim=1)
+        n += 1  # Add 1 for interaction class token
+
+        x = x + self.embedding_inter
+        x = self.encoder_inter(x)
+        x = x[:, 0].contiguous()
+        
+        x_main_features = x.view(b, -1)  # Ensure the shape is (batch_size, d_model)
+
+
+
+        #semantic feature的方法
+        # semantic_global = semantic_tokens.mean(dim=1)  # (B,T,1)
+        semantic_score = self.semantic_pool(semantic_tokens)
+        semantic_weight = F.softmax(semantic_score, dim=1)
+        # semantic_global = (semantic_weight * semantic_tokens).sum(dim=1) #0526
+        token_global = (semantic_weight * semantic_tokens).sum(dim=1)
+
+        temporal_semantic_score = self.temporal_semantic_pool(
+            semantic_feature
+        )
+        temporal_mask = torch.arange(
+            semantic_feature.shape[1],
+            device=semantic_feature.device
+        ).unsqueeze(0) < video_len.unsqueeze(1)
+        temporal_semantic_score = temporal_semantic_score.masked_fill(
+            ~temporal_mask.unsqueeze(-1),
+            torch.finfo(temporal_semantic_score.dtype).min
+        )
+        temporal_semantic_weight = F.softmax(
+            temporal_semantic_score,
+            dim=1
+        )
+        temporal_global = (
+            temporal_semantic_weight * semantic_feature
+        ).sum(dim=1)
+
+        semantic_global_alpha = self.semantic_global_gate(
+            torch.cat([token_global, temporal_global], dim=-1)
+        )
+        semantic_global = (
+            semantic_global_alpha * token_global
+            +
+            (1 - semantic_global_alpha) * temporal_global
+        )
+    
+         ##semantic attends shuttle
+        x_combined = torch.cat([
+            x_main_features,
+            semantic_global
+        ], dim=1)
+    
+        x_output = self.mlp_head(x_combined)
+        
+        return x_output
+
+class TemPose_TFwithtwostageTheStrokeTA(nn.Module):
+    def __init__(
+        self, in_dim, seq_len, n_class=31, n_people=2,
+        d_model=100, d_head=128, n_head=6, depth_tem=2, depth_inter=2,
+        drop_p=0.3, mlp_d_scale=4, tcn_kernel_size=5,
+        type_size=31, emb_size=128, hid_size=256 
+    ):
+        super().__init__()
+        
+        if n_people > 2:
+            raise NotImplementedError
+        
+        # TCN layers
+        self.project = nn.Linear(in_dim, d_model)
+
+        # TCN layers for top, bottom, shuttle
+        tcn_channels = [d_model // 2, d_model] 
+        
+        self.tcn_top = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_bottom = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_shuttle = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+
+
+        # Temporal Transformer Layers
+        self.learned_token_tem = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_tem = nn.Parameter(torch.empty(1, n_people + 3, 1 + seq_len, d_model))
+        self.pre_dropout = nn.Dropout(drop_p, inplace=True)
+        self.encoder_tem = TransformerEncoder(d_model, d_head, n_head, depth_tem, d_model * mlp_d_scale, drop_p)
+
+        # Interactional Transformer Layers
+        self.learned_token_inter = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_inter = nn.Parameter(torch.empty(1, 1 + n_people + 3, d_model))
+        self.encoder_inter = TransformerEncoder(d_model, d_head, n_head, depth_inter, d_model * mlp_d_scale, drop_p)
+
+        # MLP Head for output  
+        self.mlp_head = MLP_Head(d_model * 2, n_class, d_model * mlp_d_scale, drop_p) 
+        # self.mlp_head = ResidualMLP_Head(d_model + hid_size, n_class, d_model * mlp_d_scale, drop_p)
+
+        # Stroke fusion model
+        self.Jnb_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+
+        self.shuttle_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+        # CrossTransformerLayer
+        self.embedding_cross = nn.Parameter(torch.empty(1, seq_len, d_model))
+        self.cross_trans = CrossTransformerLayer(d_model, d_head, n_head, d_model * mlp_d_scale, drop_p)
+
+    
+        self.stroke_emb = Stroke_EmbeddingTA(type_size=type_size, emb_size=emb_size, hid_size=hid_size)
+        self.stroke_dropout = nn.Dropout(drop_p, inplace=True)
+        self.semantic_proj = nn.Linear(hid_size, d_model)
+        self.semantic_pool = nn.Linear(d_model, 1) 
+        self.semantic_type_embedding = nn.Parameter(torch.zeros(1, 1, d_model)) #0527
+        self.semantic_norm = nn.LayerNorm(d_model) #0527
+        self.temporal_semantic_pool = nn.Linear(d_model, 1) #0527
+        self.semantic_global_gate = nn.Sequential(  #0527
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()
+        )
+        self.d_model = d_model
+        self.init_weights()
+        # for param in self.stroke_fusion_model.parameters():
+        #     param.requires_grad = False
+            
+    @torch.no_grad()
+    def init_weights(self):
+        p_enc_1d_model = PositionalEncoding1D(self.d_model)
+        
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_tem.squeeze(0))
+        self.embedding_tem.copy_(pos_encoding.unsqueeze(0))
+
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_inter)
+        self.embedding_inter.copy_(pos_encoding)
+
+        nn.init.normal_(self.learned_token_tem, std=0.02)
+        nn.init.normal_(self.learned_token_inter, std=0.02)
+        nn.init.normal_(self.semantic_type_embedding, std=0.02) #0527
+
+        self.apply(self.init_weights_recursive)
+
+    def init_weights_recursive(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv1d):
+            nn.init.xavier_normal_(m.weight)
+
+    def forward(self, JnB: Tensor, pos: Tensor, shuttle: Tensor, video_len: Tensor, the_stroke: Tensor):
+       
+        
+
+        # Semantic Embedding
+        # pre_next_feature = self.stroke_fusion_model(pre_next_stroke)
+        the_emb = self.stroke_emb(the_stroke)
+        the_emb = self.stroke_dropout(self.semantic_proj(the_emb))
+        # next_emb = self.stroke_dropout(self.semantic_proj(next_emb))
+
+
+        #shuttle attends semantic
+        semantic_tokens = the_emb.unsqueeze(1)
+        semantic_tokens = self.semantic_norm(
+            semantic_tokens + self.semantic_type_embedding
+        )
+        # Step 4: Process position and shuttle data (position features for top/bottom and shuttle features)
+        pos_top = pos[:, :, 0, :].transpose(1, 2).contiguous()
+        pos_bottom = pos[:, :, 1, :].transpose(1, 2).contiguous()
+        shuttle = shuttle.transpose(1, 2).contiguous()
+       
+        # Apply TCNs on positional and shuttle data
+        pos_top = self.tcn_top(pos_top)
+        pos_bottom = self.tcn_bottom(pos_bottom)
+        shuttle = self.tcn_shuttle(shuttle)
+
+       
+        pos_top = pos_top.transpose(1, 2)
+        pos_bottom = pos_bottom.transpose(1, 2)
+        shuttle = shuttle.transpose(1, 2)
+        
+        # Cross Attention
+        T_shuttle = shuttle.shape[1]
+
+        range_t = torch.arange(
+            T_shuttle,
+            device=shuttle.device
+        ).unsqueeze(0)
+
+      
+
+
+        # shuttle attends semantic
+        semantic_mask = None
+
+        shuttle_attn = self.cross_trans(
+            shuttle,            # Q
+            semantic_tokens,    # KV
+            semantic_mask
+        )
+
+      
+        shuttle_alpha = self.shuttle_gate(
+            torch.cat([shuttle, shuttle_attn], dim=-1)
+        )
+        shuttle = shuttle + shuttle_alpha * shuttle_attn
+        JnB = JnB.transpose(1, 2).contiguous()  # (b, n, t, input_dim)
+        x = self.project(JnB)  # Project to the desired model dimension
+        b, n, t, d = x.shape  # b: batch_size, n: num_people, t: sequence_length, d: feature_dim
+        JnB_top = x[:, 0]       # (B,T,D)
+        JnB_bottom = x[:, 1]    # (B,T,D)
+
+        semantic_context_top = self.cross_trans(
+            JnB_top,          # Q
+            semantic_tokens,  # KV
+            None
+        )
+
+        semantic_context_bottom = self.cross_trans(
+            JnB_bottom,
+            semantic_tokens,
+            None
+        )
+        semantic_feature = shuttle_attn
+
+        
+        #shuttle attends semantic
+        gate_input_top = torch.cat(
+        [JnB_top, semantic_context_top],
+        dim=-1
+        )
+
+        gate_input_bottom = torch.cat(
+            [JnB_bottom, semantic_context_bottom],
+            dim=-1
+        )
+        
+      
+
+        alpha = self.Jnb_gate(gate_input_top)      # (B,T,1)
+        beta  = self.Jnb_gate(gate_input_bottom)   # (B,T,1)
+        # gamma = gate_weight[..., 2].unsqueeze(-1)
+
+        # x = (
+        #     alpha * semantic_context
+        #     +
+        #     (1 - alpha) * x
+        # )
+        JnB_top = JnB_top + alpha * semantic_context_top
+
+        JnB_bottom = JnB_bottom + beta * semantic_context_bottom
+        x = torch.stack(
+            [JnB_top, JnB_bottom],
+            dim=1
+        )
+        # Step 5: Concatenate additional features with original TCN features
+        x_additional = torch.stack((pos_top, pos_bottom, shuttle), dim=1)
+        x = torch.cat((x, x_additional), dim=1)
+        n += 3  # Update number of people with the additional features (top, bottom, shuttle)
+
+        # Step 6: Temporal Transformer Layer
+        class_token_tem = self.learned_token_tem.view(1, 1, 1, -1).expand(b, n, -1, -1)
+        x = torch.cat((class_token_tem, x), dim=2)
+        t += 1  # Add 1 for class token
+
+        x = x + self.embedding_tem
+        x = self.pre_dropout(x)
+        x = x.view(b * n, t, d)
+
+        range_t = torch.arange(0, t, device=x.device).unsqueeze(0).expand(b, -1)
+        video_len_tem = video_len.unsqueeze(-1)
+
+        mask = range_t < (
+            1 + video_len_tem
+        )
+
+        mask = mask.repeat_interleave(
+            n,
+            dim=0
+        )
+        # video_len = video_len.unsqueeze(-1)
+        # mask = range_t < (1 + video_len)
+        # mask = mask.repeat_interleave(n, dim=0)
+        
+        x = self.encoder_tem(x, mask)
+        x = x[:, 0].view(b, n, d)
+
+        # Step 7: Interactional Transformer Layer
+        class_token_inter = self.learned_token_inter.view(1, 1, -1).expand(b, -1, -1)
+        x = torch.cat((class_token_inter, x), dim=1)
+        n += 1  # Add 1 for interaction class token
+
+        x = x + self.embedding_inter
+        x = self.encoder_inter(x)
+        x = x[:, 0].contiguous()
+        
+        x_main_features = x.view(b, -1)  # Ensure the shape is (batch_size, d_model)
+
+
+
+        #semantic feature的方法
+        # semantic_global = semantic_tokens.mean(dim=1)  # (B,T,1)
+        semantic_score = self.semantic_pool(semantic_tokens)
+        semantic_weight = F.softmax(semantic_score, dim=1)
+        # semantic_global = (semantic_weight * semantic_tokens).sum(dim=1) #0526
+        token_global = (semantic_weight * semantic_tokens).sum(dim=1)
+
+        temporal_semantic_score = self.temporal_semantic_pool(
+            semantic_feature
+        )
+        temporal_mask = torch.arange(
+            semantic_feature.shape[1],
+            device=semantic_feature.device
+        ).unsqueeze(0) < video_len.unsqueeze(1)
+        temporal_semantic_score = temporal_semantic_score.masked_fill(
+            ~temporal_mask.unsqueeze(-1),
+            torch.finfo(temporal_semantic_score.dtype).min
+        )
+        temporal_semantic_weight = F.softmax(
+            temporal_semantic_score,
+            dim=1
+        )
+        temporal_global = (
+            temporal_semantic_weight * semantic_feature
+        ).sum(dim=1)
+
+        semantic_global_alpha = self.semantic_global_gate(
+            torch.cat([token_global, temporal_global], dim=-1)
+        )
+        semantic_global = (
+            semantic_global_alpha * token_global
+            +
+            (1 - semantic_global_alpha) * temporal_global
+        )
+    
+         ##semantic attends shuttle
+        x_combined = torch.cat([
+            x_main_features,
+            semantic_global
+        ], dim=1)
+    
+        x_output = self.mlp_head(x_combined)
+        
+        return x_output
+
+class TemPose_TFwithtwostageTwoStrokeTA(nn.Module):
+    def __init__(
+        self, in_dim, seq_len, n_class=31, n_people=2,
+        d_model=100, d_head=128, n_head=6, depth_tem=2, depth_inter=2,
+        drop_p=0.3, mlp_d_scale=4, tcn_kernel_size=5,
+        type_size=31, emb_size=128, hid_size=256 
+    ):
+        super().__init__()
+        
+        if n_people > 2:
+            raise NotImplementedError
+        
+        # TCN layers
+        self.project = nn.Linear(in_dim, d_model)
+
+        # TCN layers for top, bottom, shuttle
+        tcn_channels = [d_model // 2, d_model] 
+        
+        self.tcn_top = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_bottom = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_shuttle = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+
+
+        # Temporal Transformer Layers
+        self.learned_token_tem = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_tem = nn.Parameter(torch.empty(1, n_people + 3, 1 + seq_len, d_model))
+        self.pre_dropout = nn.Dropout(drop_p, inplace=True)
+        self.encoder_tem = TransformerEncoder(d_model, d_head, n_head, depth_tem, d_model * mlp_d_scale, drop_p)
+
+        # Interactional Transformer Layers
+        self.learned_token_inter = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_inter = nn.Parameter(torch.empty(1, 1 + n_people + 3, d_model))
+        self.encoder_inter = TransformerEncoder(d_model, d_head, n_head, depth_inter, d_model * mlp_d_scale, drop_p)
+
+        # MLP Head for output  
+        self.mlp_head = MLP_Head(d_model * 2, n_class, d_model * mlp_d_scale, drop_p) 
+        # self.mlp_head = ResidualMLP_Head(d_model + hid_size, n_class, d_model * mlp_d_scale, drop_p)
+
+        # Stroke fusion model
+        self.Jnb_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+
+        self.shuttle_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+        # CrossTransformerLayer
+        self.embedding_cross = nn.Parameter(torch.empty(1, seq_len, d_model))
+        self.cross_trans = CrossTransformerLayer(d_model, d_head, n_head, d_model * mlp_d_scale, drop_p)
+
+        self.stroke_emb = Stroke_EmbeddingTA(type_size=type_size, emb_size=emb_size, hid_size=hid_size)
+        self.stroke_dropout = nn.Dropout(drop_p, inplace=True)
+        self.semantic_proj = nn.Linear(hid_size, d_model)
+        self.semantic_pool = nn.Linear(d_model, 1) 
+        self.semantic_type_embedding = nn.Parameter(torch.zeros(1, 2, d_model)) #0527
+        self.semantic_norm = nn.LayerNorm(d_model) #0527
+        self.temporal_semantic_pool = nn.Linear(d_model, 1) #0527
+        self.semantic_global_gate = nn.Sequential(  #0527
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()
+        )
+        self.d_model = d_model
+        self.init_weights()
+        # for param in self.stroke_fusion_model.parameters():
+        #     param.requires_grad = False
+            
+    @torch.no_grad()
+    def init_weights(self):
+        p_enc_1d_model = PositionalEncoding1D(self.d_model)
+        
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_tem.squeeze(0))
+        self.embedding_tem.copy_(pos_encoding.unsqueeze(0))
+
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_inter)
+        self.embedding_inter.copy_(pos_encoding)
+
+        nn.init.normal_(self.learned_token_tem, std=0.02)
+        nn.init.normal_(self.learned_token_inter, std=0.02)
+        nn.init.normal_(self.semantic_type_embedding, std=0.02) #0527
+
+        self.apply(self.init_weights_recursive)
+
+    def init_weights_recursive(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv1d):
+            nn.init.xavier_normal_(m.weight)
+
+    def forward(self, JnB: Tensor, pos: Tensor, shuttle: Tensor, video_len: Tensor, pre_stroke: Tensor, the_stroke: Tensor):
+       
+
+        # Semantic Embedding
+        # pre_next_feature = self.stroke_fusion_model(pre_next_stroke)
+        pre_emb = self.stroke_emb(pre_stroke)
+        the_emb = self.stroke_emb(the_stroke)
+        pre_emb = self.stroke_dropout(self.semantic_proj(pre_emb))
+        the_emb = self.stroke_dropout(self.semantic_proj(the_emb))
+
+
+        #shuttle attends semantic
+        semantic_tokens = torch.stack(
+            [pre_emb, the_emb],
+            dim=1
+        )
+        semantic_tokens = self.semantic_norm(
+            semantic_tokens + self.semantic_type_embedding
+        )
+        # Step 4: Process position and shuttle data (position features for top/bottom and shuttle features)
+        pos_top = pos[:, :, 0, :].transpose(1, 2).contiguous()
+        pos_bottom = pos[:, :, 1, :].transpose(1, 2).contiguous()
+        shuttle = shuttle.transpose(1, 2).contiguous()
+       
+        # Apply TCNs on positional and shuttle data
+        pos_top = self.tcn_top(pos_top)
+        pos_bottom = self.tcn_bottom(pos_bottom)
+        shuttle = self.tcn_shuttle(shuttle)
+
+       
+        pos_top = pos_top.transpose(1, 2)
+        pos_bottom = pos_bottom.transpose(1, 2)
+        shuttle = shuttle.transpose(1, 2)
+        
+        # Cross Attention
+        T_shuttle = shuttle.shape[1]
+
+        range_t = torch.arange(
+            T_shuttle,
+            device=shuttle.device
+        ).unsqueeze(0)
+
+      
+
+
+        # shuttle attends semantic
+        semantic_mask = None
+
+        shuttle_attn = self.cross_trans(
+            shuttle,            # Q
+            semantic_tokens,    # KV
+            semantic_mask
+        )
+
+      
+        shuttle_alpha = self.shuttle_gate(
+            torch.cat([shuttle, shuttle_attn], dim=-1)
+        )
+        shuttle = shuttle + shuttle_alpha * shuttle_attn
+        JnB = JnB.transpose(1, 2).contiguous()  # (b, n, t, input_dim)
+        x = self.project(JnB)  # Project to the desired model dimension
+        b, n, t, d = x.shape  # b: batch_size, n: num_people, t: sequence_length, d: feature_dim
+        JnB_top = x[:, 0]       # (B,T,D)
+        JnB_bottom = x[:, 1]    # (B,T,D)
+
+        semantic_context_top = self.cross_trans(
+            JnB_top,          # Q
+            semantic_tokens,  # KV
+            None
+        )
+
+        semantic_context_bottom = self.cross_trans(
+            JnB_bottom,
+            semantic_tokens,
+            None
+        )
+        semantic_feature = shuttle_attn
+
+        
+        #shuttle attends semantic
+        gate_input_top = torch.cat(
+        [JnB_top, semantic_context_top],
+        dim=-1
+        )
+
+        gate_input_bottom = torch.cat(
+            [JnB_bottom, semantic_context_bottom],
+            dim=-1
+        )
+        
+      
+
+        alpha = self.Jnb_gate(gate_input_top)      # (B,T,1)
+        beta  = self.Jnb_gate(gate_input_bottom)   # (B,T,1)
+        # gamma = gate_weight[..., 2].unsqueeze(-1)
+
+        # x = (
+        #     alpha * semantic_context
+        #     +
+        #     (1 - alpha) * x
+        # )
+        JnB_top = JnB_top + alpha * semantic_context_top
+
+        JnB_bottom = JnB_bottom + beta * semantic_context_bottom
+        x = torch.stack(
+            [JnB_top, JnB_bottom],
+            dim=1
+        )
+        # Step 5: Concatenate additional features with original TCN features
+        x_additional = torch.stack((pos_top, pos_bottom, shuttle), dim=1)
+        x = torch.cat((x, x_additional), dim=1)
+        n += 3  # Update number of people with the additional features (top, bottom, shuttle)
+
+        # Step 6: Temporal Transformer Layer
+        class_token_tem = self.learned_token_tem.view(1, 1, 1, -1).expand(b, n, -1, -1)
+        x = torch.cat((class_token_tem, x), dim=2)
+        t += 1  # Add 1 for class token
+
+        x = x + self.embedding_tem
+        x = self.pre_dropout(x)
+        x = x.view(b * n, t, d)
+
+        range_t = torch.arange(0, t, device=x.device).unsqueeze(0).expand(b, -1)
+        video_len_tem = video_len.unsqueeze(-1)
+
+        mask = range_t < (
+            1 + video_len_tem
+        )
+
+        mask = mask.repeat_interleave(
+            n,
+            dim=0
+        )
+        # video_len = video_len.unsqueeze(-1)
+        # mask = range_t < (1 + video_len)
+        # mask = mask.repeat_interleave(n, dim=0)
+        
+        x = self.encoder_tem(x, mask)
+        x = x[:, 0].view(b, n, d)
+
+        # Step 7: Interactional Transformer Layer
+        class_token_inter = self.learned_token_inter.view(1, 1, -1).expand(b, -1, -1)
+        x = torch.cat((class_token_inter, x), dim=1)
+        n += 1  # Add 1 for interaction class token
+
+        x = x + self.embedding_inter
+        x = self.encoder_inter(x)
+        x = x[:, 0].contiguous()
+        
+        x_main_features = x.view(b, -1)  # Ensure the shape is (batch_size, d_model)
+
+
+
+        #semantic feature的方法
+        # semantic_global = semantic_tokens.mean(dim=1)  # (B,T,1)
+        semantic_score = self.semantic_pool(semantic_tokens)
+        semantic_weight = F.softmax(semantic_score, dim=1)
+        # semantic_global = (semantic_weight * semantic_tokens).sum(dim=1) #0526
+        token_global = (semantic_weight * semantic_tokens).sum(dim=1)
+
+        temporal_semantic_score = self.temporal_semantic_pool(
+            semantic_feature
+        )
+        temporal_mask = torch.arange(
+            semantic_feature.shape[1],
+            device=semantic_feature.device
+        ).unsqueeze(0) < video_len.unsqueeze(1)
+        temporal_semantic_score = temporal_semantic_score.masked_fill(
+            ~temporal_mask.unsqueeze(-1),
+            torch.finfo(temporal_semantic_score.dtype).min
+        )
+        temporal_semantic_weight = F.softmax(
+            temporal_semantic_score,
+            dim=1
+        )
+        temporal_global = (
+            temporal_semantic_weight * semantic_feature
+        ).sum(dim=1)
+
+        semantic_global_alpha = self.semantic_global_gate(
+            torch.cat([token_global, temporal_global], dim=-1)
+        )
+        semantic_global = (
+            semantic_global_alpha * token_global
+            +
+            (1 - semantic_global_alpha) * temporal_global
+        )
+    
+         ##semantic attends shuttle
+        x_combined = torch.cat([
+            x_main_features,
+            semantic_global
+        ], dim=1)
+    
+        x_output = self.mlp_head(x_combined)
+        
+        return x_output
+
+class TemPose_TFwithtwostageNextStrokeTA(nn.Module):
+    def __init__(
+        self, in_dim, seq_len, n_class=31, n_people=2,
+        d_model=100, d_head=128, n_head=6, depth_tem=2, depth_inter=2,
+        drop_p=0.3, mlp_d_scale=4, tcn_kernel_size=5,
+        type_size=31, emb_size=128, hid_size=256 
+    ):
+        super().__init__()
+        
+        if n_people > 2:
+            raise NotImplementedError
+        
+        # TCN layers
+        self.project = nn.Linear(in_dim, d_model)
+
+        # TCN layers for top, bottom, shuttle
+        tcn_channels = [d_model // 2, d_model] 
+        
+        self.tcn_top = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_bottom = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_shuttle = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+
+
+        # Temporal Transformer Layers
+        self.learned_token_tem = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_tem = nn.Parameter(torch.empty(1, n_people + 3, 1 + seq_len, d_model))
+        self.pre_dropout = nn.Dropout(drop_p, inplace=True)
+        self.encoder_tem = TransformerEncoder(d_model, d_head, n_head, depth_tem, d_model * mlp_d_scale, drop_p)
+
+        # Interactional Transformer Layers
+        self.learned_token_inter = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_inter = nn.Parameter(torch.empty(1, 1 + n_people + 3, d_model))
+        self.encoder_inter = TransformerEncoder(d_model, d_head, n_head, depth_inter, d_model * mlp_d_scale, drop_p)
+
+        # MLP Head for output  
+        self.mlp_head = MLP_Head(d_model * 2, n_class, d_model * mlp_d_scale, drop_p) 
+        # self.mlp_head = ResidualMLP_Head(d_model + hid_size, n_class, d_model * mlp_d_scale, drop_p)
+
+        # Stroke fusion model
+        self.Jnb_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+
+        self.shuttle_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+        # CrossTransformerLayer
+        self.embedding_cross = nn.Parameter(torch.empty(1, seq_len, d_model))
+        self.cross_trans = CrossTransformerLayer(d_model, d_head, n_head, d_model * mlp_d_scale, drop_p)
+
+    
+        self.stroke_emb = Stroke_EmbeddingTA(type_size=type_size, emb_size=emb_size, hid_size=hid_size)
+        self.stroke_dropout = nn.Dropout(drop_p, inplace=True)
+        self.semantic_proj = nn.Linear(hid_size, d_model)
+        self.semantic_pool = nn.Linear(d_model, 1) 
+        self.semantic_type_embedding = nn.Parameter(torch.zeros(1, 1, d_model)) #0527
+        self.semantic_norm = nn.LayerNorm(d_model) #0527
+        self.temporal_semantic_pool = nn.Linear(d_model, 1) #0527
+        self.semantic_global_gate = nn.Sequential(  #0527
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()
+        )
+        self.d_model = d_model
+        self.init_weights()
+        # for param in self.stroke_fusion_model.parameters():
+        #     param.requires_grad = False
+            
+    @torch.no_grad()
+    def init_weights(self):
+        p_enc_1d_model = PositionalEncoding1D(self.d_model)
+        
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_tem.squeeze(0))
+        self.embedding_tem.copy_(pos_encoding.unsqueeze(0))
+
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_inter)
+        self.embedding_inter.copy_(pos_encoding)
+
+        nn.init.normal_(self.learned_token_tem, std=0.02)
+        nn.init.normal_(self.learned_token_inter, std=0.02)
+        nn.init.normal_(self.semantic_type_embedding, std=0.02) #0527
+
+        self.apply(self.init_weights_recursive)
+
+    def init_weights_recursive(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv1d):
+            nn.init.xavier_normal_(m.weight)
+
+    def forward(self, JnB: Tensor, pos: Tensor, shuttle: Tensor, video_len: Tensor, next_stroke: Tensor):
+       
+        
+
+        # Semantic Embedding
+        # pre_next_feature = self.stroke_fusion_model(pre_next_stroke)
+        next_emb = self.stroke_emb(next_stroke)
+        next_emb = self.stroke_dropout(self.semantic_proj(next_emb))
+        # next_emb = self.stroke_dropout(self.semantic_proj(next_emb))
+
+
+        #shuttle attends semantic
+        semantic_tokens = next_emb.unsqueeze(1)
+        semantic_tokens = self.semantic_norm(
+            semantic_tokens + self.semantic_type_embedding
+        )
+        # Step 4: Process position and shuttle data (position features for top/bottom and shuttle features)
+        pos_top = pos[:, :, 0, :].transpose(1, 2).contiguous()
+        pos_bottom = pos[:, :, 1, :].transpose(1, 2).contiguous()
+        shuttle = shuttle.transpose(1, 2).contiguous()
+       
+        # Apply TCNs on positional and shuttle data
+        pos_top = self.tcn_top(pos_top)
+        pos_bottom = self.tcn_bottom(pos_bottom)
+        shuttle = self.tcn_shuttle(shuttle)
+
+       
+        pos_top = pos_top.transpose(1, 2)
+        pos_bottom = pos_bottom.transpose(1, 2)
+        shuttle = shuttle.transpose(1, 2)
+        
+        # Cross Attention
+        T_shuttle = shuttle.shape[1]
+
+        range_t = torch.arange(
+            T_shuttle,
+            device=shuttle.device
+        ).unsqueeze(0)
+
+      
+
+
+        # shuttle attends semantic
+        semantic_mask = None
+
+        shuttle_attn = self.cross_trans(
+            shuttle,            # Q
+            semantic_tokens,    # KV
+            semantic_mask
+        )
+
+      
+        shuttle_alpha = self.shuttle_gate(
+            torch.cat([shuttle, shuttle_attn], dim=-1)
+        )
+        shuttle = shuttle + shuttle_alpha * shuttle_attn
+        JnB = JnB.transpose(1, 2).contiguous()  # (b, n, t, input_dim)
+        x = self.project(JnB)  # Project to the desired model dimension
+        b, n, t, d = x.shape  # b: batch_size, n: num_people, t: sequence_length, d: feature_dim
+        JnB_top = x[:, 0]       # (B,T,D)
+        JnB_bottom = x[:, 1]    # (B,T,D)
+
+        semantic_context_top = self.cross_trans(
+            JnB_top,          # Q
+            semantic_tokens,  # KV
+            None
+        )
+
+        semantic_context_bottom = self.cross_trans(
+            JnB_bottom,
+            semantic_tokens,
+            None
+        )
+        semantic_feature = shuttle_attn
+
+        
+        #shuttle attends semantic
+        gate_input_top = torch.cat(
+        [JnB_top, semantic_context_top],
+        dim=-1
+        )
+
+        gate_input_bottom = torch.cat(
+            [JnB_bottom, semantic_context_bottom],
+            dim=-1
+        )
+        
+      
+
+        alpha = self.Jnb_gate(gate_input_top)      # (B,T,1)
+        beta  = self.Jnb_gate(gate_input_bottom)   # (B,T,1)
+        # gamma = gate_weight[..., 2].unsqueeze(-1)
+
+        # x = (
+        #     alpha * semantic_context
+        #     +
+        #     (1 - alpha) * x
+        # )
+        JnB_top = JnB_top + alpha * semantic_context_top
+
+        JnB_bottom = JnB_bottom + beta * semantic_context_bottom
+        x = torch.stack(
+            [JnB_top, JnB_bottom],
+            dim=1
+        )
+        # Step 5: Concatenate additional features with original TCN features
+        x_additional = torch.stack((pos_top, pos_bottom, shuttle), dim=1)
+        x = torch.cat((x, x_additional), dim=1)
+        n += 3  # Update number of people with the additional features (top, bottom, shuttle)
+
+        # Step 6: Temporal Transformer Layer
+        class_token_tem = self.learned_token_tem.view(1, 1, 1, -1).expand(b, n, -1, -1)
+        x = torch.cat((class_token_tem, x), dim=2)
+        t += 1  # Add 1 for class token
+
+        x = x + self.embedding_tem
+        x = self.pre_dropout(x)
+        x = x.view(b * n, t, d)
+
+        range_t = torch.arange(0, t, device=x.device).unsqueeze(0).expand(b, -1)
+        video_len_tem = video_len.unsqueeze(-1)
+
+        mask = range_t < (
+            1 + video_len_tem
+        )
+
+        mask = mask.repeat_interleave(
+            n,
+            dim=0
+        )
+        # video_len = video_len.unsqueeze(-1)
+        # mask = range_t < (1 + video_len)
+        # mask = mask.repeat_interleave(n, dim=0)
+        
+        x = self.encoder_tem(x, mask)
+        x = x[:, 0].view(b, n, d)
+
+        # Step 7: Interactional Transformer Layer
+        class_token_inter = self.learned_token_inter.view(1, 1, -1).expand(b, -1, -1)
+        x = torch.cat((class_token_inter, x), dim=1)
+        n += 1  # Add 1 for interaction class token
+
+        x = x + self.embedding_inter
+        x = self.encoder_inter(x)
+        x = x[:, 0].contiguous()
+        
+        x_main_features = x.view(b, -1)  # Ensure the shape is (batch_size, d_model)
+
+
+
+        #semantic feature的方法
+        # semantic_global = semantic_tokens.mean(dim=1)  # (B,T,1)
+        semantic_score = self.semantic_pool(semantic_tokens)
+        semantic_weight = F.softmax(semantic_score, dim=1)
+        # semantic_global = (semantic_weight * semantic_tokens).sum(dim=1) #0526
+        token_global = (semantic_weight * semantic_tokens).sum(dim=1)
+
+        temporal_semantic_score = self.temporal_semantic_pool(
+            semantic_feature
+        )
+        temporal_mask = torch.arange(
+            semantic_feature.shape[1],
+            device=semantic_feature.device
+        ).unsqueeze(0) < video_len.unsqueeze(1)
+        temporal_semantic_score = temporal_semantic_score.masked_fill(
+            ~temporal_mask.unsqueeze(-1),
+            torch.finfo(temporal_semantic_score.dtype).min
+        )
+        temporal_semantic_weight = F.softmax(
+            temporal_semantic_score,
+            dim=1
+        )
+        temporal_global = (
+            temporal_semantic_weight * semantic_feature
+        ).sum(dim=1)
+
+        semantic_global_alpha = self.semantic_global_gate(
+            torch.cat([token_global, temporal_global], dim=-1)
+        )
+        semantic_global = (
+            semantic_global_alpha * token_global
+            +
+            (1 - semantic_global_alpha) * temporal_global
+        )
+    
+         ##semantic attends shuttle
+        x_combined = torch.cat([
+            x_main_features,
+            semantic_global
+        ], dim=1)
+    
+        x_output = self.mlp_head(x_combined)
+        
+        return x_output
+
+class TemPose_TFwithtwostageThreeStrokeTA(nn.Module):
+    def __init__(
+        self, in_dim, seq_len, n_class=31, n_people=2,
+        d_model=100, d_head=128, n_head=6, depth_tem=2, depth_inter=2,
+        drop_p=0.3, mlp_d_scale=4, tcn_kernel_size=5,
+        type_size=31, emb_size=128, hid_size=256 
+    ):
+        super().__init__()
+        
+        if n_people > 2:
+            raise NotImplementedError
+        
+        # TCN layers
+        self.project = nn.Linear(in_dim, d_model)
+
+        # TCN layers for top, bottom, shuttle
+        tcn_channels = [d_model // 2, d_model] 
+        
+        self.tcn_top = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_bottom = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+        self.tcn_shuttle = TCN(2, tcn_channels, tcn_kernel_size, drop_p)
+
+
+        # Temporal Transformer Layers
+        self.learned_token_tem = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_tem = nn.Parameter(torch.empty(1, n_people + 3, 1 + seq_len, d_model))
+        self.pre_dropout = nn.Dropout(drop_p, inplace=True)
+        self.encoder_tem = TransformerEncoder(d_model, d_head, n_head, depth_tem, d_model * mlp_d_scale, drop_p)
+
+        # Interactional Transformer Layers
+        self.learned_token_inter = nn.Parameter(torch.randn(1, d_model))
+        self.embedding_inter = nn.Parameter(torch.empty(1, 1 + n_people + 3, d_model))
+        self.encoder_inter = TransformerEncoder(d_model, d_head, n_head, depth_inter, d_model * mlp_d_scale, drop_p)
+
+        # MLP Head for output  
+        self.mlp_head = MLP_Head(d_model * 2, n_class, d_model * mlp_d_scale, drop_p) 
+        # self.mlp_head = ResidualMLP_Head(d_model + hid_size, n_class, d_model * mlp_d_scale, drop_p)
+
+        # Stroke fusion model
+        self.Jnb_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+
+        self.shuttle_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model , 1),
+            nn.Sigmoid()
+        )
+        # CrossTransformerLayer
+        self.embedding_cross = nn.Parameter(torch.empty(1, seq_len, d_model))
+        self.cross_trans = CrossTransformerLayer(d_model, d_head, n_head, d_model * mlp_d_scale, drop_p)
+
+        self.stroke_emb = Stroke_EmbeddingTA(type_size=type_size, emb_size=emb_size, hid_size=hid_size)
+        self.stroke_ca = Stroke_TA(type_size=type_size, emb_size=emb_size, hid_size=hid_size)
+        self.stroke_dropout = nn.Dropout(drop_p, inplace=True)
+        self.semantic_proj = nn.Linear(hid_size, d_model)
+        self.semantic_pool = nn.Linear(d_model, 1) 
+        self.semantic_type_embedding = nn.Parameter(torch.zeros(1, 3, d_model)) #0527
+        self.semantic_norm = nn.LayerNorm(d_model) #0527
+        self.temporal_semantic_pool = nn.Linear(d_model, 1) #0527
+        self.semantic_global_gate = nn.Sequential(  #0527
+            nn.Linear(d_model * 2, d_model),
+            nn.ReLU(),
+            nn.Dropout(drop_p),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()
+        )
+        self.d_model = d_model
+        self.init_weights()
+        # for param in self.stroke_fusion_model.parameters():
+        #     param.requires_grad = False
+            
+    @torch.no_grad()
+    def init_weights(self):
+        p_enc_1d_model = PositionalEncoding1D(self.d_model)
+        
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_tem.squeeze(0))
+        self.embedding_tem.copy_(pos_encoding.unsqueeze(0))
+
+        pos_encoding: Tensor = p_enc_1d_model(self.embedding_inter)
+        self.embedding_inter.copy_(pos_encoding)
+
+        nn.init.normal_(self.learned_token_tem, std=0.02)
+        nn.init.normal_(self.learned_token_inter, std=0.02)
+        nn.init.normal_(self.semantic_type_embedding, std=0.02) #0527
+
+        self.apply(self.init_weights_recursive)
+
+    def init_weights_recursive(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv1d):
+            nn.init.xavier_normal_(m.weight)
+
+    def forward(self, JnB: Tensor, pos: Tensor, shuttle: Tensor, video_len: Tensor, pre_next_stroke: Tensor, the_stroke: Tensor):
+       
+
+        # Semantic Embedding
+        # pre_next_feature = self.stroke_fusion_model(pre_next_stroke)
+        pre_emb, next_emb = self.stroke_ca(pre_next_stroke)
+        the_emb = self.stroke_emb(the_stroke)
+        pre_emb = self.stroke_dropout(self.semantic_proj(pre_emb))
+        next_emb = self.stroke_dropout(self.semantic_proj(next_emb))
+        the_emb = self.stroke_dropout(self.semantic_proj(the_emb))
+
+
+        #shuttle attends semantic
+        semantic_tokens = torch.stack(
+            [pre_emb, the_emb, next_emb],
+            dim=1
+        )
+        semantic_tokens = self.semantic_norm(
+            semantic_tokens + self.semantic_type_embedding
+        )
+        # Step 4: Process position and shuttle data (position features for top/bottom and shuttle features)
+        pos_top = pos[:, :, 0, :].transpose(1, 2).contiguous()
+        pos_bottom = pos[:, :, 1, :].transpose(1, 2).contiguous()
+        shuttle = shuttle.transpose(1, 2).contiguous()
+       
+        # Apply TCNs on positional and shuttle data
+        pos_top = self.tcn_top(pos_top)
+        pos_bottom = self.tcn_bottom(pos_bottom)
+        shuttle = self.tcn_shuttle(shuttle)
+
+       
+        pos_top = pos_top.transpose(1, 2)
+        pos_bottom = pos_bottom.transpose(1, 2)
+        shuttle = shuttle.transpose(1, 2)
+        
+        # Cross Attention
+        T_shuttle = shuttle.shape[1]
+
+        range_t = torch.arange(
+            T_shuttle,
+            device=shuttle.device
+        ).unsqueeze(0)
+
+      
+
+
+        # shuttle attends semantic
+        semantic_mask = None
+
+        shuttle_attn = self.cross_trans(
+            shuttle,            # Q
+            semantic_tokens,    # KV
+            semantic_mask
+        )
+
+      
+        shuttle_alpha = self.shuttle_gate(
+            torch.cat([shuttle, shuttle_attn], dim=-1)
+        )
+        shuttle = shuttle + shuttle_alpha * shuttle_attn
+        JnB = JnB.transpose(1, 2).contiguous()  # (b, n, t, input_dim)
+        x = self.project(JnB)  # Project to the desired model dimension
+        b, n, t, d = x.shape  # b: batch_size, n: num_people, t: sequence_length, d: feature_dim
+        JnB_top = x[:, 0]       # (B,T,D)
+        JnB_bottom = x[:, 1]    # (B,T,D)
+
+        semantic_context_top = self.cross_trans(
+            JnB_top,          # Q
+            semantic_tokens,  # KV
+            None
+        )
+
+        semantic_context_bottom = self.cross_trans(
+            JnB_bottom,
+            semantic_tokens,
+            None
+        )
+        semantic_feature = shuttle_attn
+
+        
+        #shuttle attends semantic
+        gate_input_top = torch.cat(
+        [JnB_top, semantic_context_top],
+        dim=-1
+        )
+
+        gate_input_bottom = torch.cat(
+            [JnB_bottom, semantic_context_bottom],
+            dim=-1
+        )
+        
+      
+
+        alpha = self.Jnb_gate(gate_input_top)      # (B,T,1)
+        beta  = self.Jnb_gate(gate_input_bottom)   # (B,T,1)
+        # gamma = gate_weight[..., 2].unsqueeze(-1)
+
+        # x = (
+        #     alpha * semantic_context
+        #     +
+        #     (1 - alpha) * x
+        # )
+        JnB_top = JnB_top + alpha * semantic_context_top
+
+        JnB_bottom = JnB_bottom + beta * semantic_context_bottom
+        x = torch.stack(
+            [JnB_top, JnB_bottom],
+            dim=1
+        )
+        # Step 5: Concatenate additional features with original TCN features
+        x_additional = torch.stack((pos_top, pos_bottom, shuttle), dim=1)
+        x = torch.cat((x, x_additional), dim=1)
+        n += 3  # Update number of people with the additional features (top, bottom, shuttle)
+
+        # Step 6: Temporal Transformer Layer
+        class_token_tem = self.learned_token_tem.view(1, 1, 1, -1).expand(b, n, -1, -1)
+        x = torch.cat((class_token_tem, x), dim=2)
+        t += 1  # Add 1 for class token
+
+        x = x + self.embedding_tem
+        x = self.pre_dropout(x)
+        x = x.view(b * n, t, d)
+
+        range_t = torch.arange(0, t, device=x.device).unsqueeze(0).expand(b, -1)
+        video_len_tem = video_len.unsqueeze(-1)
+
+        mask = range_t < (
+            1 + video_len_tem
+        )
+
+        mask = mask.repeat_interleave(
+            n,
+            dim=0
+        )
+        # video_len = video_len.unsqueeze(-1)
+        # mask = range_t < (1 + video_len)
+        # mask = mask.repeat_interleave(n, dim=0)
+        
+        x = self.encoder_tem(x, mask)
+        x = x[:, 0].view(b, n, d)
+
+        # Step 7: Interactional Transformer Layer
+        class_token_inter = self.learned_token_inter.view(1, 1, -1).expand(b, -1, -1)
+        x = torch.cat((class_token_inter, x), dim=1)
+        n += 1  # Add 1 for interaction class token
+
+        x = x + self.embedding_inter
+        x = self.encoder_inter(x)
+        x = x[:, 0].contiguous()
+        
+        x_main_features = x.view(b, -1)  # Ensure the shape is (batch_size, d_model)
+
+
+
+        #semantic feature的方法
+        # semantic_global = semantic_tokens.mean(dim=1)  # (B,T,1)
+        semantic_score = self.semantic_pool(semantic_tokens)
+        semantic_weight = F.softmax(semantic_score, dim=1)
+        # semantic_global = (semantic_weight * semantic_tokens).sum(dim=1) #0526
+        token_global = (semantic_weight * semantic_tokens).sum(dim=1)
+
+        temporal_semantic_score = self.temporal_semantic_pool(
+            semantic_feature
+        )
+        temporal_mask = torch.arange(
+            semantic_feature.shape[1],
+            device=semantic_feature.device
+        ).unsqueeze(0) < video_len.unsqueeze(1)
+        temporal_semantic_score = temporal_semantic_score.masked_fill(
+            ~temporal_mask.unsqueeze(-1),
+            torch.finfo(temporal_semantic_score.dtype).min
+        )
+        temporal_semantic_weight = F.softmax(
+            temporal_semantic_score,
+            dim=1
+        )
+        temporal_global = (
+            temporal_semantic_weight * semantic_feature
+        ).sum(dim=1)
+
+        semantic_global_alpha = self.semantic_global_gate(
+            torch.cat([token_global, temporal_global], dim=-1)
+        )
+        semantic_global = (
+            semantic_global_alpha * token_global
+            +
+            (1 - semantic_global_alpha) * temporal_global
+        )
+    
+         ##semantic attends shuttle
+        x_combined = torch.cat([
+            x_main_features,
+            semantic_global
+        ], dim=1)
+    
+        x_output = self.mlp_head(x_combined)
+        
+        return x_output
+
 
 if __name__ == '__main__':
     n_features = (17 + 19 * 2) * 2
@@ -4217,6 +6192,15 @@ if __name__ == '__main__':
     #     d_model=100
     # )
 
+    # input_data = [pose, pos, shuttle, videos_len, pre_next_stroke]
+    # model = TemPose_TFwithtwostageStrokeTA(
+    #     in_dim=n_features,
+    #     seq_len=seq_len,
+    #     n_class=31,
+    #     d_model=100
+    # )
+    
+
     # input_data = [pose, pos, shuttle, videos_len, pre_stroke]
     # model = TemPose_TFwithOneStroke(
     #     in_dim=n_features,
@@ -4224,8 +6208,25 @@ if __name__ == '__main__':
     #     n_class=31,
     #     d_model=100
     # )
+
+    # input_data = [pose, pos, shuttle, videos_len, pre_stroke]
+    # model = TemPose_TFwithtwostageOneStrokeTA(
+    #     in_dim=n_features,
+    #     seq_len=seq_len,
+    #     n_class=31,
+    #     d_model=100
+    # )
+    
     # input_data = [pose, pos, shuttle, videos_len, the_stroke]
     # model = TemPose_TFwithTheStroke(
+    #     in_dim=n_features,
+    #     seq_len=seq_len,
+    #     n_class=31,
+    #     d_model=100
+    # )
+
+    # input_data = [pose, pos, shuttle, videos_len, the_stroke]
+    # model = TemPose_TFwithtwostageTheStrokeTA(
     #     in_dim=n_features,
     #     seq_len=seq_len,
     #     n_class=31,
@@ -4240,6 +6241,14 @@ if __name__ == '__main__':
     #     d_model=100
     # )
 
+    # input_data = [pose, pos, shuttle, videos_len, next_stroke]
+    # model = TemPose_TFwithtwostageNextStrokeTA(
+    #     in_dim=n_features,
+    #     seq_len=seq_len,
+    #     n_class=31,
+    #     d_model=100
+    # )
+
     # input_data = [pose, pos, shuttle, videos_len, pre_stroke, the_stroke]
     # model = TemPose_TFwithTwoStroke(
     #     in_dim=n_features,
@@ -4247,8 +6256,25 @@ if __name__ == '__main__':
     #     n_class=31,
     #     d_model=100
     # )
+
+    # input_data = [pose, pos, shuttle, videos_len, pre_stroke, the_stroke]
+    # model = TemPose_TFwithtwostageTwoStrokeTA(
+    #     in_dim=n_features,
+    #     seq_len=seq_len,
+    #     n_class=31,
+    #     d_model=100
+    # )
+
+    # input_data = [pose, pos, shuttle, videos_len, pre_next_stroke, the_stroke]
+    # model = TemPose_TFwithThreeStroke(
+    #     in_dim=n_features,
+    #     seq_len=seq_len,
+    #     n_class=31,
+    #     d_model=100
+    # )
+
     input_data = [pose, pos, shuttle, videos_len, pre_next_stroke, the_stroke]
-    model = TemPose_TFwithThreeStroke(
+    model = TemPose_TFwithtwostageThreeStrokeTA(
         in_dim=n_features,
         seq_len=seq_len,
         n_class=31,
