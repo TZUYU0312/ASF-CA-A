@@ -15,19 +15,10 @@
 
 8. TemPose-TF-TSF -> Tempose_TFwiththeStroke_main.py & tempose.py (Tempose_TFwiththeStroke (line 2116 in tempose.py))
 
-9. TemPose-TF -> Tempose_TF_main.py & tempose.py (TemPose_TF (line 912 in tempose.py))
+9. TemPose-TF-BiLP -> (1) Train LSTMPredictor first. (use LSTMPredictor.py and LSTMPredictor_main.py) (2) Run Tempose_TFwithtwostageLSTMPredictor_main.py & TemposewithRNNPredictor.py (Tempose_TFwithtwostageBiLSTMPredictor (line 2975 in TemposewithRNNPredcitor.py))
 
-10. TemPose-V -> tempose_V_main.py & tempose.py (TemPose_V (line 427 in tempose.py))
+10. LSTMPredictor -> LSTMPredictor_main.py & LSTMPredictor.py (LSTMPredictor (line 18 in LSTMPredictor.py))
 
-11. TemPose-TF-BiLP -> (1) Train LSTMPredictor first. (use LSTMPredictor.py and LSTMPredictor_main.py) (2) Run Tempose_TFwithtwostageLSTMPredictor_main.py & TemposewithRNNPredictor.py (Tempose_TFwithtwostageBiLSTMPredictor (line 2975 in TemposewithRNNPredcitor.py))
-
-12. LSTMPredictor -> LSTMPredictor_main.py & LSTMPredictor.py (LSTMPredictor (line 18 in LSTMPredictor.py))
-
-13. BlockGCN -> blockgcn_main.py & blockgcn.py (BlockGCN_10 (line 402 in blockgcn.py))
-
-14. SkateFormer -> skateformer_main.py & skateformer.py (SkateFormer (line 463 in skateformer.py))
-
-15. BST-CG-AP -> bst_main.py & bst.py (BST_8 (line 2797 in bst.py))
 
 # Reference
 Environment Setting from Jing-Yuan Chang: https://github.com/Va6lue/BST-Badminton-Stroke-type-Transformer
