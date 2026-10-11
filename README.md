@@ -31,6 +31,7 @@
 
 # Reference
 Environment Setting from Jing-Yuan Chang: https://github.com/Va6lue/BST-Badminton-Stroke-type-Transformer
+
 BST-CG-AP: https://github.com/Va6lue/BST-Badminton-Stroke-type-Transformer
 
 TemPose: https://github.com/MagnusPetersenIbh/TemPose-BadmintonActionRecognition
