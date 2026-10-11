@@ -23,7 +23,7 @@ Hyp = namedtuple('Hyp', [
 ])
 hyp = Hyp(
     n_epochs=1600,
-    early_stop_n_epochs=50,
+    early_stop_n_epochs=300,
     batch_size=128,
     lr=5e-2,
     weight_decay=1e-2,
@@ -395,9 +395,9 @@ class Task:
 
 if __name__ == '__main__':
     task = Task()
-    task.prepare_dataloaders(root_dir=Path('rally_data_npy_collated'), pose_style='J_only')
+    task.prepare_dataloaders(root_dir=Path('rally_data_npy_collated22'), pose_style='J_only')
     task.get_network_architecture(model_name='BlockGCN_10')
-    task.seek_network_weights(model_info='', serial_no=1)
+    task.seek_network_weights(model_info='rally_data_npy_collated22', serial_no=1)
     task.test(show_details=False, show_confusion_matrix=False)
     task.test_topk_acc(k=2)
     # task.compare_pred_gt_on_specific_type(

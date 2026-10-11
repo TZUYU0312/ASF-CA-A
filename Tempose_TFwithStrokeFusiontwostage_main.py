@@ -15,7 +15,7 @@ from datetime import timedelta
 from dataset import get_bone_pairs, prepare_npy_collated_for_temposestroke_loaders,\
                     RandomTranslation_batch, Dataset_npy
 from tempose import TemPose_TF, TemPose2_TF, TemPose_TFwithtwoStageStrokeFusion, TemPose2_TFwithStrokeFusion, \
-                ConvTemPose_TFwithStrokeFusion, TemPose_GFwithStrokeFusion
+                ConvTemPose_TFwithStrokeFusion, TemPose_GFwithStrokeFusion, TemPose_TFwithtwostageStrokeCA, TemPose_TFwithtwostageStrokeTA
 from utils import show_f1_results, plot_confusion_matrix, generate_text_error_report, class_ls_inv
 
 
@@ -93,6 +93,8 @@ def train_one_epoch(
             [pre_next_stroke_pair[:-2], pre_next_stroke_pair[2:]], dim=1
         )
 
+
+        
         # ---------- 修正特殊類別 ----------
         mask_current = torch.isin(pred_stage1, special_classes)
         pre_next_stroke_pair[mask_current, 0] = 0
@@ -578,6 +580,21 @@ class Task:
                 )
 
             
+            case 'TemPose_TFwithtwostageStrokeCA':
+                net = TemPose_TFwithtwostageStrokeCA(
+                    in_dim=(self.n_joints + n_bones * extra) * in_channels,
+                    n_class=hyp.n_classes,
+                    seq_len=hyp.seq_len,
+                    depth_inter=2
+                )
+
+            case 'TemPose_TFwithtwostageStrokeTA':
+                net = TemPose_TFwithtwostageStrokeTA(
+                    in_dim=(self.n_joints + n_bones * extra) * in_channels,
+                    n_class=hyp.n_classes,
+                    seq_len=hyp.seq_len,
+                    depth_inter=2
+                )
 
             case _:
                 raise NotImplementedError
@@ -689,7 +706,7 @@ if __name__ == '__main__':
         pose_style='JnB_bone',
         train_partial=1
     )
-    task.get_network_architecture(model_name='TemPose_TFwithtwoStageStrokeFusion', in_channels=2)
+    task.get_network_architecture(model_name='TemPose_TFwithtwostageStrokeTA', in_channels=2)
     task.seek_network_weights(model_info='rally_data_npy_collated', serial_no=11)
     task.test(show_details=False, show_confusion_matrix=True, show_misclassified_reports = False)
     task.test_topk_acc(k=2)

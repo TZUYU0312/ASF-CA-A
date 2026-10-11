@@ -594,12 +594,12 @@ class Task:
 if __name__ == '__main__':
     task = Task(n_joints=17)
     task.prepare_dataloaders(
-        root_dir=Path("rally_data_npy_collated"),
+        root_dir=Path("rally_data_npy_collated22"),
         pose_style='JnB_bone',
         train_partial=1
     )
     task.get_network_architecture(model_name='BST_8', in_channels=2)
-    task.seek_network_weights(model_info='rally_data_npy_collated', serial_no=11)
+    task.seek_network_weights(model_info='rally_data_npy_collated22', serial_no=11)
     task.test(show_details=False, show_confusion_matrix=False)
     task.test_topk_acc(k=2)
     # task.compare_pred_gt_on_specific_type(

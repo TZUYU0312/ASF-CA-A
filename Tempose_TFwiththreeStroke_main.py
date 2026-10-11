@@ -15,7 +15,7 @@ from datetime import timedelta
 from dataset import get_bone_pairs, prepare_npy_collated_for_temposestroke_loaders,\
                     RandomTranslation_batch, Dataset_npy
 from tempose import TemPose_TF, TemPose2_TF, TemPose_TFwithtwoStageStrokeFusion, TemPose_TFwithThreeStroke, \
-                ConvTemPose_TFwithStrokeFusion, TemPose_GFwithStrokeFusion
+                ConvTemPose_TFwithStrokeFusion, TemPose_GFwithStrokeFusion, TemPose_TFwithtwostageThreeStrokeTA
 from utils import show_f1_results, plot_confusion_matrix, generate_text_error_report, class_ls_inv
 
 
@@ -1259,7 +1259,13 @@ class Task:
                     depth_inter=2
                 )
 
-            
+            case 'TemPose_TFwithtwostageThreeStrokeTA':
+                net = TemPose_TFwithtwostageThreeStrokeTA(
+                    in_dim=(self.n_joints + n_bones * extra) * in_channels,
+                    n_class=hyp.n_classes,
+                    seq_len=hyp.seq_len,
+                    depth_inter=2
+                )   
 
             case _:
                 raise NotImplementedError
@@ -1371,7 +1377,7 @@ if __name__ == '__main__':
         pose_style='JnB_bone',
         train_partial=1
     )
-    task.get_network_architecture(model_name='TemPose_TFwithThreeStroke', in_channels=2)
+    task.get_network_architecture(model_name='TemPose_TFwithtwostageThreeStrokeTA', in_channels=2)
     task.seek_network_weights(model_info='rally_data_npy_collated', serial_no=11)
     task.test(show_details=False, show_confusion_matrix=False, show_misclassified_reports = False)
     task.test_topk_acc(k=2)

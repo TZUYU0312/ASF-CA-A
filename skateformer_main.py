@@ -450,12 +450,12 @@ class Task:
 if __name__ == '__main__':
     task = Task()
     task.prepare_dataloaders(
-        root_dir=Path('rally_data_npy_collated'),
+        root_dir=Path('rally_data_npy_collated22'),
         pose_style='J_only',
         train_partial=1
     )
     task.get_network_architecture(model_name='SkateFormer_2')
-    task.seek_network_weights(model_info='some_no_weight_decay', serial_no=1)
+    task.seek_network_weights(model_info='some_no_weight_decay22', serial_no=1)
     task.test(show_details=False, show_confusion_matrix=False)
     task.test_topk_acc(k=2)
     # task.compare_pred_gt_on_specific_type(

@@ -1716,14 +1716,14 @@ class LSTMPredictor(nn.Module):
         if self.is_reverse:
             # 載入後向模型的權重
             try:
-                self.load_state_dict(torch.load("weight/lstmpredictor_backward.pt", weights_only=True))
+                self.load_state_dict(torch.load("weight/lstmpredictor_backward22.pt", weights_only=True))
                 print("成功載入後向 LSTM 模型權重。")
             except FileNotFoundError:
                 print("錯誤：找不到後向 LSTM 模型權重檔案。")
         else:
             # 載入前向模型的權重
             try:
-                self.load_state_dict(torch.load("weight/lstmpredictor.pt", weights_only=True))
+                self.load_state_dict(torch.load("weight/lstmpredictor22.pt", weights_only=True))
                 print("成功載入前向 LSTM 模型權重。")
             except FileNotFoundError:
                 print("錯誤：找不到前向 LSTM 模型權重檔案。")
