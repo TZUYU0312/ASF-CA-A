@@ -1,8 +1,8 @@
 # TemPose: a new skeleton-based transformer model designed for fine-grained motion recognition in badminton
 # (2023/08) https://ieeexplore.ieee.org/document/10208321
 # Authors: Magnus Ibh, Stella Grasshof, Dan Witzner, Pascal Madeleine
-
 # Modified by Jing-Yuan Chang
+# Modified by Tzu-Yu Liu
 
 import torch
 from torch import nn, Tensor
