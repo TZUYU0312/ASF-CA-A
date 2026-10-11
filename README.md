@@ -1,4 +1,4 @@
-# ASF-CA-A Model name in python file
+# Python file Model name for ASF-CA-A
 1. ASF-CA-A -> Tempose_TFwithStrokeFusiontwostage_main.py & tempose.py (TemPose_TFwithtwostageStrokeTA  (line 4346 in tempose.py)) 
 
 2. ASF-CA-P -> Tempose_TFwithOneStroke_main.py & tempose.py (TemPose_TFwithtwostageOneStrokeTA (line 4657 in tempose.py))
