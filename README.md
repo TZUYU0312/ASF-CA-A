@@ -29,3 +29,5 @@
 
 15. BST-CG-AP -> bst_main.py & bst.py (BST_8 (line 2797 in bst.py))
 
+#Reference
+https://github.com/Va6lue/BST-Badminton-Stroke-type-Transformer
