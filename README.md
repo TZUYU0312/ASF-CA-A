@@ -37,3 +37,6 @@ TemPose: https://github.com/MagnusPetersenIbh/TemPose-BadmintonActionRecognition
 BlockGCN: https://github.com/ZhouYuxuanYX/BlockGCN
 
 SkateFormer: https://github.com/KAIST-VICLab/SkateFormer
+
+# Paper
+ASF-CA-A: https://scholar.google.com/scholar?hl=zh-TW&as_sdt=0%2C5&q=ASF-CA-A&btnG=
