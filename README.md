@@ -30,4 +30,7 @@
 15. BST-CG-AP -> bst_main.py & bst.py (BST_8 (line 2797 in bst.py))
 
 # Reference
-https://github.com/Va6lue/BST-Badminton-Stroke-type-Transformer
+BST-CG-AP: https://github.com/Va6lue/BST-Badminton-Stroke-type-Transformer
+TemPose: https://github.com/MagnusPetersenIbh/TemPose-BadmintonActionRecognition
+BlockGCN: https://github.com/ZhouYuxuanYX/BlockGCN
+SkateFormer: https://github.com/KAIST-VICLab/SkateFormer
